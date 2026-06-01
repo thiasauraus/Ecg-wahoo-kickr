@@ -42,6 +42,9 @@ class EcgViewModel(application: Application) : AndroidViewModel(application) {
     private val _isFtmsConnected = MutableStateFlow(false)
     val isFtmsConnected: StateFlow<Boolean> = _isFtmsConnected.asStateFlow()
 
+    private val _isControlTransferred = MutableStateFlow(false)
+    val isControlTransferred: StateFlow<Boolean> = _isControlTransferred.asStateFlow()
+
     private var service: PolarH10Service? = null
     private var bound = false
     private var shouldScanWhenConnected = false
@@ -82,6 +85,9 @@ class EcgViewModel(application: Application) : AndroidViewModel(application) {
             }
             viewModelScope.launch {
                 s.isFtmsConnected.collect { _isFtmsConnected.value = it }
+            }
+            viewModelScope.launch {
+                s.isControlTransferred.collect { _isControlTransferred.value = it }
             }
 
             if (shouldScanWhenConnected) {

@@ -61,6 +61,9 @@ class PolarH10Service : Service() {
     private val _isFtmsConnected = MutableStateFlow(false)
     val isFtmsConnected: StateFlow<Boolean> = _isFtmsConnected.asStateFlow()
 
+    private val _isControlTransferred = MutableStateFlow(false)
+    val isControlTransferred: StateFlow<Boolean> = _isControlTransferred.asStateFlow()
+
     // --- Legacy and Polar ECG logic ---
     private val ecgBuffer = kotlin.collections.ArrayDeque<Int>()
     private var lastEcgEmit = 0L
@@ -69,6 +72,11 @@ class PolarH10Service : Service() {
     private var hrGatt: BluetoothGatt? = null
     private var ftmsGatt: BluetoothGatt? = null
     private var scanning = false
+
+    private var lastHrDevice: BluetoothDevice? = null
+    private var lastFtmsDevice: BluetoothDevice? = null
+    private var userWantsConnection = false
+    private val handler = android.os.Handler(android.os.Looper.getMainLooper())
 
     // --- Service & Characteristic UUIDs ---
     private val HR_SERVICE_UUID = UUID.fromString("0000180d-0000-1000-8000-00805f9b34fb")
@@ -218,6 +226,8 @@ class PolarH10Service : Service() {
     }
 
     private fun connectHrDevice(device: BluetoothDevice) {
+        lastHrDevice = device
+        userWantsConnection = true
         val deviceName = try {
             device.name ?: device.address
         } catch (e: Exception) {
@@ -233,6 +243,8 @@ class PolarH10Service : Service() {
     }
 
     private fun connectFtmsDevice(device: BluetoothDevice) {
+        lastFtmsDevice = device
+        userWantsConnection = true
         val deviceName = try {
             device.name ?: device.address
         } catch (e: Exception) {
@@ -272,6 +284,15 @@ class PolarH10Service : Service() {
                     updateNotification()
                     try { hrGatt?.close() } catch (e: Exception) {}
                     hrGatt = null
+
+                    if (userWantsConnection && lastHrDevice != null) {
+                        _status.value = "H10 connection lost. Reconnecting..."
+                        handler.postDelayed({
+                            if (userWantsConnection && hrGatt == null) {
+                                lastHrDevice?.let { connectHrDevice(it) }
+                            }
+                        }, 3000)
+                    }
                 }
             }
         }
@@ -371,6 +392,7 @@ class PolarH10Service : Service() {
                 }
                 BluetoothProfile.STATE_DISCONNECTED -> {
                     _isFtmsConnected.value = false
+                    _isControlTransferred.value = false
                     _status.value = "KICKR Disconnected"
                     _cadence.value = null
                     _actualPower.value = null
@@ -379,6 +401,15 @@ class PolarH10Service : Service() {
                     updateNotification()
                     try { ftmsGatt?.close() } catch (e: Exception) {}
                     ftmsGatt = null
+
+                    if (userWantsConnection && lastFtmsDevice != null) {
+                        _status.value = "KICKR connection lost. Reconnecting..."
+                        handler.postDelayed({
+                            if (userWantsConnection && ftmsGatt == null) {
+                                lastFtmsDevice?.let { connectFtmsDevice(it) }
+                            }
+                        }, 3000)
+                    }
                 }
             }
         }
@@ -405,8 +436,9 @@ class PolarH10Service : Service() {
             characteristic: BluetoothGattCharacteristic,
             value: ByteArray
         ) {
-            if (characteristic.uuid == INDOOR_BIKE_DATA_UUID) {
-                parseIndoorBike(value)
+            when (characteristic.uuid) {
+                INDOOR_BIKE_DATA_UUID -> parseIndoorBike(value)
+                FTMS_CONTROL_POINT_UUID -> parseControlPointIndication(value)
             }
         }
 
@@ -415,8 +447,9 @@ class PolarH10Service : Service() {
             gatt: BluetoothGatt,
             characteristic: BluetoothGattCharacteristic
         ) {
-            if (characteristic.uuid == INDOOR_BIKE_DATA_UUID) {
-                parseIndoorBike(characteristic.value)
+            when (characteristic.uuid) {
+                INDOOR_BIKE_DATA_UUID -> parseIndoorBike(characteristic.value)
+                FTMS_CONTROL_POINT_UUID -> parseControlPointIndication(characteristic.value)
             }
         }
 
@@ -564,10 +597,6 @@ class PolarH10Service : Service() {
                 controlChar.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
                 gatt.writeCharacteristic(controlChar)
             }
-            // Auto write default 220W after briefly waiting or straight away
-            android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
-                writeTargetPower(_targetPower.value)
-            }, 500)
         } catch (e: Exception) {
             Log.e(TAG, "Error writing control request: ${e.message}")
         }
@@ -575,6 +604,10 @@ class PolarH10Service : Service() {
 
     private fun writeTargetPower(watts: Int) {
         val gatt = ftmsGatt ?: return
+        if (!_isControlTransferred.value) {
+            Log.w(TAG, "Wahoo KICKR control not transferred yet. Postponing message.")
+            return
+        }
         try {
             val service = gatt.getService(FTMS_SERVICE_UUID) ?: return
             val controlChar = service.getCharacteristic(FTMS_CONTROL_POINT_UUID) ?: return
@@ -594,6 +627,36 @@ class PolarH10Service : Service() {
             }
         } catch (e: Exception) {
             Log.e(TAG, "Error writing target power: ${e.message}")
+        }
+    }
+
+    private fun parseControlPointIndication(data: ByteArray) {
+        if (data.size < 3) return
+        val responseCode = data[0]
+        val requestOpcode = data[1]
+        val resultCode = data[2]
+
+        Log.d(TAG, "FTMS Control Point Indication: Response Code=0x${String.format("%02X", responseCode)}, Request Opcode=0x${String.format("%02X", requestOpcode)}, Result Code=0x${String.format("%02X", resultCode)}")
+
+        if (responseCode == 0x80.toByte()) {
+            if (requestOpcode == 0x00.toByte()) { // Response to Request Control
+                if (resultCode == 0x01.toByte()) { // Success
+                    Log.i(TAG, "Wahoo KICKR successfully transferred control!")
+                    _isControlTransferred.value = true
+                    _status.value = "KICKR Control Transferred"
+                    // Send default target power now that control is transferred
+                    writeTargetPower(_targetPower.value)
+                } else {
+                    Log.e(TAG, "Wahoo KICKR control transfer failed: $resultCode")
+                    _status.value = "KICKR control denied: $resultCode"
+                }
+            } else if (requestOpcode == 0x05.toByte()) { // Response to Set Target Power
+                if (resultCode == 0x01.toByte()) {
+                    Log.i(TAG, "Wahoo KICKR target power write successful!")
+                } else {
+                    Log.e(TAG, "Wahoo KICKR target power write failed: $resultCode")
+                }
+            }
         }
     }
 
@@ -758,6 +821,10 @@ class PolarH10Service : Service() {
     }
 
     fun disconnect() {
+        userWantsConnection = false
+        lastHrDevice = null
+        lastFtmsDevice = null
+        _isControlTransferred.value = false
         stopScan()
         try {
             hrGatt?.disconnect()

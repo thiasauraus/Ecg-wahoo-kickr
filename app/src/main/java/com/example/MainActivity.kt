@@ -275,6 +275,7 @@ fun TrainerControlCard(viewModel: EcgViewModel) {
     val actualPower by viewModel.actualPower.collectAsState()
     val targetPower by viewModel.targetPower.collectAsState()
     val isFtmsConnected by viewModel.isFtmsConnected.collectAsState()
+    val isControlTransferred by viewModel.isControlTransferred.collectAsState()
 
     Card(
         modifier = Modifier
@@ -301,8 +302,16 @@ fun TrainerControlCard(viewModel: EcgViewModel) {
             Spacer(modifier = Modifier.height(6.dp))
 
             // State indicator bullet
-            val statusColor = if (isFtmsConnected) Color(0xFF4CAF50) else Color.Gray
-            val statusText = if (isFtmsConnected) "Connected" else "Disconnected"
+            val statusColor = if (isFtmsConnected) {
+                if (isControlTransferred) Color(0xFF4CAF50) else Color(0xFFFF9800)
+            } else {
+                Color.Gray
+            }
+            val statusText = if (isFtmsConnected) {
+                if (isControlTransferred) "Connected & Control Granted" else "Connected (Awaiting Control...)"
+            } else {
+                "Disconnected"
+            }
             Row(
                 verticalAlignment = Alignment.CenterVertically
             ) {
@@ -392,7 +401,7 @@ fun TrainerControlCard(viewModel: EcgViewModel) {
             ) {
                 Button(
                     onClick = { viewModel.adjustTargetPower(-5) },
-                    enabled = isFtmsConnected,
+                    enabled = isFtmsConnected && isControlTransferred,
                     modifier = Modifier
                         .weight(1f)
                         .height(48.dp),
@@ -407,7 +416,7 @@ fun TrainerControlCard(viewModel: EcgViewModel) {
 
                 Button(
                     onClick = { viewModel.adjustTargetPower(5) },
-                    enabled = isFtmsConnected,
+                    enabled = isFtmsConnected && isControlTransferred,
                     modifier = Modifier
                         .weight(1f)
                         .height(48.dp),
