@@ -1,0 +1,6 @@
+{
+  "name": "Trainer & Polar H10 ECG",
+  "description": "An Android app to stream ECG & Heart rate from Polar H10 and control Wahoo KICKR smart trainers in ERG mode with metric readouts.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
