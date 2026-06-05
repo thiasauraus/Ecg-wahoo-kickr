@@ -30,6 +30,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import java.util.UUID
 import android.annotation.SuppressLint
+import android.content.pm.ServiceInfo
 
 @SuppressLint("MissingPermission")
 class PolarH10Service : Service() {
@@ -58,6 +59,9 @@ class PolarH10Service : Service() {
     private val _targetPower = MutableStateFlow(220)
     val targetPower: StateFlow<Int> = _targetPower.asStateFlow()
 
+    private val _elapsedSeconds = MutableStateFlow(0L)
+    val elapsedSeconds: StateFlow<Long> = _elapsedSeconds.asStateFlow()
+
     private val _isFtmsConnected = MutableStateFlow(false)
     val isFtmsConnected: StateFlow<Boolean> = _isFtmsConnected.asStateFlow()
 
@@ -77,6 +81,86 @@ class PolarH10Service : Service() {
     private var lastFtmsDevice: BluetoothDevice? = null
     private var userWantsConnection = false
     private val handler = android.os.Handler(android.os.Looper.getMainLooper())
+    private var timerRunning = false
+    private var timerBaseElapsed = 0L
+    private var timerStartRealtime = 0L
+    private val timerRunnable = object : Runnable {
+        override fun run() {
+            if (timerRunning) {
+                val now = android.os.SystemClock.elapsedRealtime()
+                _elapsedSeconds.value = timerBaseElapsed + ((now - timerStartRealtime) / 1000)
+                updateNotification()
+                handler.postDelayed(this, 1000)
+            }
+        }
+    }
+
+    fun startTimer() {
+        if (!timerRunning) {
+            timerRunning = true
+            timerStartRealtime = android.os.SystemClock.elapsedRealtime()
+            handler.post(timerRunnable)
+            _elapsedSeconds.value = timerBaseElapsed
+            updateNotification()
+            _status.value = "Timer started"
+        }
+    }
+
+    fun stopTimer() {
+        if (timerRunning) {
+            timerRunning = false
+            timerBaseElapsed = _elapsedSeconds.value
+            handler.removeCallbacks(timerRunnable)
+            _status.value = "Timer paused"
+            updateNotification()
+        }
+    }
+
+    fun resetTimer() {
+        timerRunning = false
+        handler.removeCallbacks(timerRunnable)
+        timerBaseElapsed = 0L
+        _elapsedSeconds.value = 0L
+        updateNotification()
+        _status.value = "Timer reset"
+    }
+
+    private val gattOperationQueue = ArrayDeque<() -> Unit>()
+    private var pendingOperation = false
+
+    @Synchronized
+    private fun enqueueOperation(operation: () -> Unit) {
+        gattOperationQueue.addLast(operation)
+        if (!pendingOperation) {
+            executeNextOperation()
+        }
+    }
+
+    @Synchronized
+    private fun executeNextOperation() {
+        if (pendingOperation) return
+        val op = gattOperationQueue.removeFirstOrNull() ?: return
+        pendingOperation = true
+        try {
+            op()
+        } catch (e: Exception) {
+            Log.e(TAG, "GATT operation failed", e)
+            signalOperationComplete()
+        }
+    }
+
+    @Synchronized
+    private fun signalOperationComplete() {
+        pendingOperation = false
+        executeNextOperation()
+    }
+
+    @Synchronized
+    private fun clearOperationQueue() {
+        gattOperationQueue.clear()
+        pendingOperation = false
+    }
+
 
     // --- Service & Characteristic UUIDs ---
     private val HR_SERVICE_UUID = UUID.fromString("0000180d-0000-1000-8000-00805f9b34fb")
@@ -95,6 +179,8 @@ class PolarH10Service : Service() {
     private var lastBpm = "--"
     private var lastCadenceText = "--"
     private var lastPowerText = "--"
+    private var lastTimerText = "00:00"
+    private var lastNotif = 0L
 
     companion object {
         const val CHANNEL_ID = "polar_h10_channel"
@@ -123,10 +209,28 @@ class PolarH10Service : Service() {
             return START_NOT_STICKY
         } else if (intent?.action == "START_FOREGROUND") {
             try {
+                val notification = buildNotification("--", false, "--", "--", "00:00")
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    startForeground(NOTIFICATION_ID, buildNotification("--", false, "--", "--"), android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
+                    val hasBodySensors = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                        androidx.core.content.ContextCompat.checkSelfPermission(
+                            this,
+                            android.Manifest.permission.BODY_SENSORS
+                        ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+                    } else {
+                        true
+                    }
+                    val type = if (Build.VERSION.SDK_INT >= 34) {
+                        var t = ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
+                        if (hasBodySensors) {
+                            t = t or ServiceInfo.FOREGROUND_SERVICE_TYPE_HEALTH
+                        }
+                        t
+                    } else {
+                        ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
+                    }
+                    startForeground(NOTIFICATION_ID, notification, type)
                 } else {
-                    startForeground(NOTIFICATION_ID, buildNotification("--", false, "--", "--"))
+                    startForeground(NOTIFICATION_ID, notification)
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "Exception starting foreground service", e)
@@ -284,6 +388,7 @@ class PolarH10Service : Service() {
                     updateNotification()
                     try { hrGatt?.close() } catch (e: Exception) {}
                     hrGatt = null
+                    clearOperationQueue()
 
                     if (userWantsConnection && lastHrDevice != null) {
                         _status.value = "H10 connection lost. Reconnecting..."
@@ -349,6 +454,7 @@ class PolarH10Service : Service() {
                     Log.e(TAG, "ECG control write failed: $status")
                 }
             }
+            signalOperationComplete()
         }
 
         override fun onDescriptorWrite(
@@ -358,6 +464,7 @@ class PolarH10Service : Service() {
         ) {
             if (status != BluetoothGatt.GATT_SUCCESS) {
                 Log.e(TAG, "H10 descriptor write failed: ${descriptor?.uuid} status: $status")
+                signalOperationComplete()
                 return
             }
             when (descriptor?.characteristic?.uuid) {
@@ -370,6 +477,7 @@ class PolarH10Service : Service() {
                     gatt?.let { writeStartECGCommand(it) }
                 }
             }
+            signalOperationComplete()
         }
     }
 
@@ -401,6 +509,7 @@ class PolarH10Service : Service() {
                     updateNotification()
                     try { ftmsGatt?.close() } catch (e: Exception) {}
                     ftmsGatt = null
+                    clearOperationQueue()
 
                     if (userWantsConnection && lastFtmsDevice != null) {
                         _status.value = "KICKR connection lost. Reconnecting..."
@@ -460,6 +569,7 @@ class PolarH10Service : Service() {
         ) {
             if (status != BluetoothGatt.GATT_SUCCESS) {
                 Log.e(TAG, "KICKR descriptor write failed: ${descriptor?.uuid} status: $status")
+                signalOperationComplete()
                 return
             }
             if (descriptor?.characteristic?.uuid == INDOOR_BIKE_DATA_UUID) {
@@ -469,6 +579,7 @@ class PolarH10Service : Service() {
                 Log.d(TAG, "KICKR Control Point indications enabled, requesting control")
                 gatt?.let { requestFtmsControl(it) }
             }
+            signalOperationComplete()
         }
 
         override fun onCharacteristicWrite(
@@ -483,6 +594,7 @@ class PolarH10Service : Service() {
                     Log.e(TAG, "KICKR command write failed: $status")
                 }
             }
+            signalOperationComplete()
         }
     }
 
@@ -493,11 +605,13 @@ class PolarH10Service : Service() {
             val char = service.getCharacteristic(HR_CHAR_UUID) ?: return
             gatt.setCharacteristicNotification(char, true)
             val descriptor = char.getDescriptor(CCCD_UUID) ?: return
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                gatt.writeDescriptor(descriptor, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
-            } else {
-                descriptor.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-                gatt.writeDescriptor(descriptor)
+            enqueueOperation {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    gatt.writeDescriptor(descriptor, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
+                } else {
+                    descriptor.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+                    gatt.writeDescriptor(descriptor)
+                }
             }
         } catch (e: Exception) {
             Log.e(TAG, "H10 setup error", e)
@@ -513,11 +627,13 @@ class PolarH10Service : Service() {
             val dataChar = pmdService.getCharacteristic(PMD_DATA_UUID) ?: return
             gatt.setCharacteristicNotification(dataChar, true)
             val descriptor = dataChar.getDescriptor(CCCD_UUID) ?: return
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                gatt.writeDescriptor(descriptor, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
-            } else {
-                descriptor.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-                gatt.writeDescriptor(descriptor)
+            enqueueOperation {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    gatt.writeDescriptor(descriptor, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
+                } else {
+                    descriptor.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+                    gatt.writeDescriptor(descriptor)
+                }
             }
         } catch (e: Exception) {
             Log.e(TAG, "ECG setup error", e)
@@ -529,12 +645,14 @@ class PolarH10Service : Service() {
             val pmdService = gatt.getService(PMD_SERVICE_UUID) ?: return
             val controlChar = pmdService.getCharacteristic(PMD_CONTROL_UUID) ?: return
             val startCmd = byteArrayOf(0x02, 0x00, 0x00, 0x01, 0x82.toByte(), 0x00, 0x01, 0x01, 0x0E, 0x00)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                gatt.writeCharacteristic(controlChar, startCmd, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT)
-            } else {
-                controlChar.value = startCmd
-                controlChar.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
-                gatt.writeCharacteristic(controlChar)
+            enqueueOperation {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    gatt.writeCharacteristic(controlChar, startCmd, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT)
+                } else {
+                    controlChar.value = startCmd
+                    controlChar.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+                    gatt.writeCharacteristic(controlChar)
+                }
             }
         } catch (e: Exception) {
             Log.e(TAG, "ECG start command error", e)
@@ -553,11 +671,13 @@ class PolarH10Service : Service() {
             }
             gatt.setCharacteristicNotification(char, true)
             val descriptor = char.getDescriptor(CCCD_UUID) ?: return
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                gatt.writeDescriptor(descriptor, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
-            } else {
-                descriptor.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-                gatt.writeDescriptor(descriptor)
+            enqueueOperation {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    gatt.writeDescriptor(descriptor, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
+                } else {
+                    descriptor.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+                    gatt.writeDescriptor(descriptor)
+                }
             }
         } catch (e: Exception) {
             Log.e(TAG, "KICKR subscribe setup error", e)
@@ -573,11 +693,13 @@ class PolarH10Service : Service() {
             }
             gatt.setCharacteristicNotification(char, true)
             val descriptor = char.getDescriptor(CCCD_UUID) ?: return
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                gatt.writeDescriptor(descriptor, BluetoothGattDescriptor.ENABLE_INDICATION_VALUE)
-            } else {
-                descriptor.value = BluetoothGattDescriptor.ENABLE_INDICATION_VALUE
-                gatt.writeDescriptor(descriptor)
+            enqueueOperation {
+                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                     gatt.writeDescriptor(descriptor, BluetoothGattDescriptor.ENABLE_INDICATION_VALUE)
+                 } else {
+                     descriptor.value = BluetoothGattDescriptor.ENABLE_INDICATION_VALUE
+                     gatt.writeDescriptor(descriptor)
+                 }
             }
         } catch (e: Exception) {
             Log.e(TAG, "KICKR Control Point enable error", e)
@@ -590,12 +712,14 @@ class PolarH10Service : Service() {
             val controlChar = service.getCharacteristic(FTMS_CONTROL_POINT_UUID) ?: return
             val cmd = byteArrayOf(0x00) // Opcode 0x00: Request Control
             Log.d(TAG, "KICKR write Request Control")
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                gatt.writeCharacteristic(controlChar, cmd, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT)
-            } else {
-                controlChar.value = cmd
-                controlChar.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
-                gatt.writeCharacteristic(controlChar)
+            enqueueOperation {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    gatt.writeCharacteristic(controlChar, cmd, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT)
+                } else {
+                    controlChar.value = cmd
+                    controlChar.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+                    gatt.writeCharacteristic(controlChar)
+                }
             }
         } catch (e: Exception) {
             Log.e(TAG, "Error writing control request: ${e.message}")
@@ -618,12 +742,14 @@ class PolarH10Service : Service() {
                 ((watts shr 8) and 0xFF).toByte()
             )
             Log.d(TAG, "Writing ERG Target Power: $watts W")
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                gatt.writeCharacteristic(controlChar, cmd, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT)
-            } else {
-                controlChar.value = cmd
-                controlChar.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
-                gatt.writeCharacteristic(controlChar)
+            enqueueOperation {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    gatt.writeCharacteristic(controlChar, cmd, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT)
+                } else {
+                    controlChar.value = cmd
+                    controlChar.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+                    gatt.writeCharacteristic(controlChar)
+                }
             }
         } catch (e: Exception) {
             Log.e(TAG, "Error writing target power: ${e.message}")
@@ -698,7 +824,7 @@ class PolarH10Service : Service() {
 
             synchronized(ecgBuffer) {
                 ecgBuffer.addLast(microVolts)
-                if (ecgBuffer.size > 800) {
+                if (ecgBuffer.size > 400) {
                     ecgBuffer.removeFirst()
                 }
             }
@@ -706,7 +832,7 @@ class PolarH10Service : Service() {
         }
 
         val now = System.currentTimeMillis()
-        if (now - lastEcgEmit > 50) {
+        if (now - lastEcgEmit > 100) {
             val snapshot = synchronized(ecgBuffer) { ecgBuffer.toIntArray() }
             _ecgData.value = snapshot
             lastEcgEmit = now
@@ -714,49 +840,97 @@ class PolarH10Service : Service() {
     }
 
     private fun parseIndoorBike(data: ByteArray) {
-        if (data.size < 2) return
-        var index = 2
-        val flags = (data[0].toInt() and 0xFF) or ((data[1].toInt() and 0xFF) shl 8)
+        if (data.size < 2) return // need at least flags
+        var index = 0
+        val flags = (data[index].toInt() and 0xFF) or ((data[index + 1].toInt() and 0xFF) shl 8)
+        index += 2
 
-        val hasSpeed = (flags and 0x01) == 0
-        val hasAvgSpeed = (flags and 0x02) != 0
-        val hasCadence = (flags and 0x04) != 0
-        val hasAvgCadence = (flags and 0x08) != 0
-        val hasTotalDistance = (flags and 0x10) != 0
-        val hasResistance = (flags and 0x20) != 0
-        val hasPower = (flags and 0x40) != 0
+        // FTMS Specifications: Instantaneous Speed is present if More Data (bit 0) is 0
+        val hasInstantSpeed = (flags and 0x0001) == 0
+        val hasAvgSpeed = (flags and 0x0002) != 0
+        val hasInstantCadence = (flags and 0x0004) != 0
+        val hasAvgCadence = (flags and 0x0008) != 0
+        val hasTotalDistance = (flags and 0x0010) != 0
+        val hasResistance = (flags and 0x0020) != 0
+        val hasInstantPower = (flags and 0x0040) != 0
+        val hasAvgPower = (flags and 0x0080) != 0
 
-        try {
-            if (hasSpeed) index += 2
-            if (hasAvgSpeed) index += 2
-            if (hasCadence) {
-                if (index + 2 <= data.size) {
-                    val rawCadence = (data[index].toInt() and 0xFF) or ((data[index+1].toInt() and 0xFF) shl 8)
-                    val cadenceVal = (rawCadence * 0.5).toInt()
-                    _cadence.value = cadenceVal
-                    lastCadenceText = cadenceVal.toString()
-                    index += 2
-                }
+        if (hasInstantSpeed) {
+            if (index + 1 < data.size) {
+                val instantaneousSpeedRaw = (data[index].toInt() and 0xFF) or ((data[index + 1].toInt() and 0xFF) shl 8)
+                // val speedKmh = instantaneousSpeedRaw * 0.01
+                index += 2
+            } else {
+                return // truncated
             }
-            if (hasAvgCadence) index += 2
-            if (hasTotalDistance) index += 3
-            if (hasResistance) index += 2
-            if (hasPower) {
-                if (index + 2 <= data.size) {
-                    val rawPower = (data[index].toInt() and 0xFF) or (data[index+1].toInt() shl 8)
-                    val powerVal = rawPower.toShort().toInt()
-                    _actualPower.value = powerVal
-                    lastPowerText = powerVal.toString()
-                    index += 2
-                }
-            }
-
-            updateNotification()
-        } catch (e: Exception) {
-            Log.e(TAG, "FTMS parsing exception: ${e.message}")
         }
-    }
 
+        if (hasAvgSpeed) {
+            if (index + 1 < data.size) {
+                index += 2
+            } else {
+                return // truncated
+            }
+        }
+
+        if (hasInstantCadence) {
+            if (index + 1 < data.size) {
+                val rawCadence = (data[index].toInt() and 0xFF) or ((data[index + 1].toInt() and 0xFF) shl 8)
+                val cadenceVal = (rawCadence * 0.5).toInt() // 0.5 rpm resolution per spec
+                _cadence.value = cadenceVal
+                lastCadenceText = cadenceVal.toString()
+                index += 2
+            } else {
+                return // truncated
+            }
+        }
+
+        if (hasAvgCadence) {
+            if (index + 1 < data.size) {
+                index += 2
+            } else {
+                return // truncated
+            }
+        }
+
+        if (hasTotalDistance) {
+            if (index + 2 < data.size) {
+                index += 3 // 24-bit total distance per spec
+            } else {
+                return // truncated
+            }
+        }
+
+        if (hasResistance) {
+            if (index < data.size) {
+                index += 1 // Resistance Level is sint8 (1 byte per BLE FTMS spec)
+            } else {
+                return // truncated
+            }
+        }
+
+        if (hasInstantPower) {
+            if (index + 1 < data.size) {
+                val rawPower = (data[index].toInt() and 0xFF) or ((data[index + 1].toInt() and 0xFF) shl 8)
+                val powerVal = rawPower.toShort().toInt() // sint16 per BLE FTMS spec
+                _actualPower.value = powerVal
+                lastPowerText = powerVal.toString()
+                index += 2
+            } else {
+                return // truncated
+            }
+        }
+
+        if (hasAvgPower) {
+            if (index + 1 < data.size) {
+                index += 2
+            } else {
+                return // truncated
+            }
+        }
+
+        updateNotification()
+    }
     // --- Foreground Persistence & Notification Builders ---
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -775,7 +949,7 @@ class PolarH10Service : Service() {
         }
     }
 
-    private fun buildNotification(bpmText: String, isConnected: Boolean, cadenceText: String, powerText: String): Notification {
+    private fun buildNotification(bpmText: String, isConnected: Boolean, cadenceText: String, powerText: String, timerText: String): Notification {
         val intent = Intent(this, MainActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
         }
@@ -792,15 +966,28 @@ class PolarH10Service : Service() {
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
 
+        val statusChipText = "BPM: $bpmText  •  ⏱️ $timerText"
+
         val info = buildString {
-            append("HR: $bpmText BPM")
-            if (cadenceText != "--") append(" | Cad: $cadenceText RPM")
-            if (powerText != "--") append(" | Power: $powerText W")
+            var first = true
+            if (cadenceText != "--") {
+                append("Cadence: $cadenceText RPM")
+                first = false
+            }
+            if (powerText != "--") {
+                if (!first) append("   |   ")
+                append("Power: $powerText W")
+                first = false
+            }
+            if (first) {
+                append("Connected & Monitoring Statistics")
+            }
         }
 
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("Smart Trainer & ECG Monitor")
             .setContentText(info)
+            .setSubText(statusChipText)
             .setSmallIcon(android.R.drawable.ic_dialog_info)
             .setContentIntent(pendingIntent)
             .setOngoing(true)
@@ -810,11 +997,21 @@ class PolarH10Service : Service() {
             .build()
     }
 
-    private fun updateNotification() {
+        private fun updateNotification() {
+        val now = android.os.SystemClock.elapsedRealtime()
+        if (now - lastNotif < 500) return
+        lastNotif = now
         try {
-            val notification = buildNotification(lastBpm, _isConnected.value || _isFtmsConnected.value, lastCadenceText, lastPowerText)
+            val secs = _elapsedSeconds.value
+            lastTimerText = String.format("%02d:%02d", secs / 60, secs % 60)
+            val notification = buildNotification(lastBpm, _isConnected.value || _isFtmsConnected.value, lastCadenceText, lastPowerText, lastTimerText)
             val manager = getSystemService(NotificationManager::class.java)
-            manager.notify(NOTIFICATION_ID, notification)
+            // Use startForeground to keep the service alive on Android 14+
+            try {
+                startForeground(NOTIFICATION_ID, notification)
+            } catch (e: Exception) {
+                manager.notify(NOTIFICATION_ID, notification)
+            }
         } catch (e: Exception) {
             Log.e(TAG, "Notification refresh error", e)
         }
@@ -826,6 +1023,7 @@ class PolarH10Service : Service() {
         lastFtmsDevice = null
         _isControlTransferred.value = false
         stopScan()
+        clearOperationQueue()
         try {
             hrGatt?.disconnect()
         } catch (e: Exception) {
@@ -839,8 +1037,10 @@ class PolarH10Service : Service() {
     }
 
     override fun onDestroy() {
+        handler.removeCallbacksAndMessages(null)
         super.onDestroy()
         disconnect()
+        stopForeground(STOP_FOREGROUND_REMOVE)
         try { hrGatt?.close() } catch (e: Exception) {}
         try { ftmsGatt?.close() } catch (e: Exception) {}
         hrGatt = null

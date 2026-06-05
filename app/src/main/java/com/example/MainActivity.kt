@@ -25,6 +25,8 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
@@ -46,6 +48,7 @@ import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import com.example.ui.theme.PolarH10ECGTheme
 import android.annotation.SuppressLint
+import android.content.pm.PackageManager
 
 @SuppressLint("MissingPermission")
 class MainActivity : ComponentActivity() {
@@ -60,6 +63,10 @@ class MainActivity : ComponentActivity() {
             viewModel.updateStatus("Bluetooth enabling was canceled")
         }
     }
+
+    private val notificationPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { }
 
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
@@ -167,6 +174,9 @@ class MainActivity : ComponentActivity() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             permissions.add(Manifest.permission.POST_NOTIFICATIONS)
         }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            permissions.add(Manifest.permission.BODY_SENSORS)
+        }
         permissionLauncher.launch(permissions.toTypedArray())
     }
 }
@@ -188,6 +198,7 @@ fun MainScreen(
             .fillMaxSize()
             .statusBarsPadding()
             .navigationBarsPadding()
+            .verticalScroll(rememberScrollState())
             .padding(16.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Top
@@ -242,6 +253,11 @@ fun MainScreen(
             color = Color.Gray,
             fontWeight = FontWeight.Medium
         )
+
+        Spacer(modifier = Modifier.height(16.dp))
+
+        // Personal Workout Timer UI Component
+        WorkoutTimerCard(viewModel = viewModel)
 
         Spacer(modifier = Modifier.height(16.dp))
 
@@ -427,6 +443,86 @@ fun TrainerControlCard(viewModel: EcgViewModel) {
                     elevation = ButtonDefaults.buttonElevation(defaultElevation = 2.dp)
                 ) {
                     Text("+ 5 W", fontWeight = FontWeight.ExtraBold, fontSize = 16.sp)
+
+                }
+}
+        }
+    }
+}
+
+@Composable
+fun WorkoutTimerCard(viewModel: EcgViewModel) {
+    val elapsedSeconds by viewModel.elapsedSeconds.collectAsState()
+
+    val minutes = elapsedSeconds / 60
+    val seconds = elapsedSeconds % 60
+    val timeString = String.format("%02d:%02d", minutes, seconds)
+
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 4.dp),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.secondaryContainer
+        ),
+        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(16.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Text(
+                text = "WORKOUT TIMER",
+                fontSize = 11.sp,
+                fontWeight = FontWeight.Bold,
+                color = MaterialTheme.colorScheme.onSecondaryContainer.copy(alpha = 0.7f)
+            )
+
+            Spacer(modifier = Modifier.height(4.dp))
+
+            Text(
+                text = timeString,
+                fontSize = 32.sp,
+                fontWeight = FontWeight.Black,
+                color = MaterialTheme.colorScheme.onSecondaryContainer
+            )
+
+            Spacer(modifier = Modifier.height(14.dp))
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Button(
+                    onClick = { viewModel.startTimer() },
+                    modifier = Modifier.weight(1f),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = Color(0xFF4CAF50)
+                    )
+                ) {
+                    Text("Start", fontWeight = FontWeight.Bold, color = Color.White)
+                }
+
+                Button(
+                    onClick = { viewModel.stopTimer() },
+                    modifier = Modifier.weight(1f),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = Color(0xFFFF9800)
+                    )
+                ) {
+                    Text("Pause", fontWeight = FontWeight.Bold, color = Color.White)
+                }
+
+                Button(
+                    onClick = { viewModel.resetTimer() },
+                    modifier = Modifier.weight(1f),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = Color(0xFFE91E63)
+                    )
+                ) {
+                    Text("Reset", fontWeight = FontWeight.Bold, color = Color.White)
                 }
             }
         }
@@ -453,39 +549,50 @@ fun EcgGraphContainer(viewModel: EcgViewModel, modifier: Modifier = Modifier) {
 @Composable
 fun EcgGraph(data: IntArray, modifier: Modifier = Modifier) {
     val pathColor = MaterialTheme.colorScheme.primary
+    // Cache grid to avoid rebuilding every frame
+    val gridCache = androidx.compose.runtime.remember { mutableMapOf<Pair<Int,Int>, Pair<androidx.compose.ui.graphics.Path, androidx.compose.ui.graphics.Path>>() }
 
     Canvas(modifier = modifier) {
         val width = size.width
         val height = size.height
-
         if (width <= 0f || height <= 0f) return@Canvas
 
-        drawGrid(width, height)
+        // Draw cached grid
+        val key = width.toInt() to height.toInt()
+        val (minorPath, majorPath) = gridCache.getOrPut(key) {
+            val minor = androidx.compose.ui.graphics.Path()
+            val major = androidx.compose.ui.graphics.Path()
+            for (x in 0..width.toInt() step 10) {
+                val path = if (x % 50 == 0) major else minor
+                path.moveTo(x.toFloat(), 0f)
+                path.lineTo(x.toFloat(), height)
+            }
+            for (y in 0..height.toInt() step 10) {
+                val path = if (y % 50 == 0) major else minor
+                path.moveTo(0f, y.toFloat())
+                path.lineTo(width, y.toFloat())
+            }
+            minor to major
+        }
+        drawPath(minorPath, Color(0xFFFFE6E6), style = androidx.compose.ui.graphics.drawscope.Stroke(1f))
+        drawPath(majorPath, Color(0xFFFFB3B3), style = androidx.compose.ui.graphics.drawscope.Stroke(1f))
 
         if (data.size < 2) return@Canvas
 
-        var min = data.minOrNull() ?: 0
-        var max = data.maxOrNull() ?: 0
-        var range = max - min
+        // Fixed range for Polar H10 ECG (~±1000 µV) – avoids min/max scan every frame
+        val min = -1000
+        val max = 1000
+        val range = 2000f
 
-        if (range < 1000) {
-            val mid = (max + min) / 2
-            min = mid - 500
-            max = mid + 500
-            range = 1000
-        } else {
-            min -= (range * 0.1).toInt()
-            max += (range * 0.1).toInt()
-            range = max - min
-        }
-
-        val step = width / 800f
+        val step = width / 400f  // match 400-point buffer
         val startX = (width - data.size * step).coerceAtLeast(0f)
 
         val path = androidx.compose.ui.graphics.Path().apply {
+            // Downsample if needed – draw every point but path is cheap
             data.forEachIndexed { i, value ->
                 val x = startX + i * step
-                val normalizedY = (value - min).toFloat() / range
+                val clamped = value.coerceIn(min, max)
+                val normalizedY = (clamped - min) / range
                 val y = height - (normalizedY * height)
                 if (i == 0) moveTo(x, y) else lineTo(x, y)
             }

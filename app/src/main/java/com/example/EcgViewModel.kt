@@ -6,6 +6,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
 import android.os.IBinder
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -44,6 +45,9 @@ class EcgViewModel(application: Application) : AndroidViewModel(application) {
 
     private val _isControlTransferred = MutableStateFlow(false)
     val isControlTransferred: StateFlow<Boolean> = _isControlTransferred.asStateFlow()
+
+    private val _elapsedSeconds = MutableStateFlow(0L)
+    val elapsedSeconds: StateFlow<Long> = _elapsedSeconds.asStateFlow()
 
     private var service: PolarH10Service? = null
     private var bound = false
@@ -89,6 +93,9 @@ class EcgViewModel(application: Application) : AndroidViewModel(application) {
             viewModelScope.launch {
                 s.isControlTransferred.collect { _isControlTransferred.value = it }
             }
+            viewModelScope.launch {
+                s.elapsedSeconds.collect { _elapsedSeconds.value = it }
+            }
 
             if (shouldScanWhenConnected) {
                 shouldScanWhenConnected = false
@@ -130,7 +137,7 @@ class EcgViewModel(application: Application) : AndroidViewModel(application) {
             action = "START_FOREGROUND"
         }
         try {
-            app.startService(intent)
+            androidx.core.content.ContextCompat.startForegroundService(app, intent)
         } catch (e: Exception) {
             android.util.Log.e("EcgViewModel", "Failed to start service", e)
         }
@@ -148,6 +155,18 @@ class EcgViewModel(application: Application) : AndroidViewModel(application) {
 
     fun adjustTargetPower(delta: Int) {
         service?.adjustTargetPower(delta)
+    }
+
+    fun startTimer() {
+        service?.startTimer()
+    }
+
+    fun stopTimer() {
+        service?.stopTimer()
+    }
+
+    fun resetTimer() {
+        service?.resetTimer()
     }
 
     fun disconnect() {
